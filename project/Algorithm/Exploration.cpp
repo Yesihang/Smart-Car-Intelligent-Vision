@@ -7,7 +7,7 @@
 DTCM_DATA Exploration patrol_planner;
 
 // ============================================================================
-// 参数面板
+// 参数面板：巡图启发式代价与观测配置
 // ============================================================================
 
 namespace ExplorationConfig {
@@ -420,7 +420,7 @@ struct PatrolDfsFrame {
     int support_prefix_len[9];                        // 每个前置推箱任务结束时的路径长度
 };
 
-/// \brief 巡图规划共享 scratch，默认放 OCRAM 避免栈溢出和 DTCM 压力
+/// \brief 巡图规划共享 scratch，放 OCRAM 避免栈溢出和 DTCM 压力
 struct PatrolScratchWorkspace {
     uint16_t micro_tt_sig[8192];       // 小型置换表签名
     int32_t micro_tt_cost[8192];       // 小型置换表最低代价
@@ -446,7 +446,7 @@ struct PatrolScratchWorkspace {
     PatrolDfsFrame dfs_frames[PATROL_DFS_FRAME_LIMIT];       // 按递归深度复用的帧数组
 };
 
-// 巡图大工作区默认放 OCRAM，避免占用 DTCM
+// 巡图大工作区放 OCRAM，链接脚本必须将 .ocram_bss 放到非 DTCM 区域
 static PatrolScratchWorkspace patrol_ws;
 
 

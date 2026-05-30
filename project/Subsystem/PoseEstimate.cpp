@@ -18,10 +18,6 @@ extern "C" {
 #include "Encoder.h"
 #include <cmath>
 
-// =============================================================================
-// 内部数据结构和状态变量
-// =============================================================================
-
 namespace Subsystem::PoseEstimator {
 namespace { 
     #define DTCM_DATA __attribute__((section(".dtcm_data")))
@@ -43,289 +39,26 @@ namespace {
     // 四元数相关变量，四元数初始化为绝对水平、Yaw为 90度 [cos(45deg) = 0.70710678f, sin(45deg) = 0.70710678f]
     DTCM_DATA float q0 = 0.70710678f, q1 = 0.0f, q2 = 0.0f, q3 = 0.70710678f;
 
-    // 视觉标定相关变量
-    DTCM_DATA VisionCalibrator vision_calibrator;                     // 视觉标定器实例
-    DTCM_DATA AsyncCalibState s_calib_state = AsyncCalibState::IDLE;  // 当前标定状态
-    DTCM_DATA uint32_t s_last_calib_vision_seq = 0;                   // 标定流程已消费的最后一帧视觉序号
-
-    constexpr uint32_t MAX_VISION_LATENCY_LOOKBACK_MS =
-        static_cast<uint32_t>(TuningDefaults::MAX_VISION_LATENCY_MS);
-    constexpr uint32_t ODOM_HISTORY_LOOKBACK_MS = 3000U;
-    static_assert(ODOM_HISTORY_LOOKBACK_MS >= MAX_VISION_LATENCY_LOOKBACK_MS,
-                  "Odom history must cover the configured vision latency range");
-    constexpr uint16_t ODOM_HISTORY_SIZE =
-        static_cast<uint16_t>(ODOM_HISTORY_LOOKBACK_MS / SystemConfig::PIT_CH1_PERIOD_MS + 3U);
-    constexpr uint32_t ODOM_HISTORY_COVERAGE_MS =
-        static_cast<uint32_t>(ODOM_HISTORY_SIZE - 1U) * SystemConfig::PIT_CH1_PERIOD_MS;
-
-    struct OdomPoseSample {
-        uint32_t tick_ms = 0;
-        Pose2D pose = {0.0f, 0.0f, SystemConfig::ENTRY_YAW};
-        bool valid = false;
-    };
-
-    // 编码器纯积分轨迹，只用于把延时视觉坐标外推到当前时刻，不受视觉修正本身影响
-    DTCM_DATA Pose2D s_encoder_pose = {0.0f, 0.0f, SystemConfig::ENTRY_YAW};
-    DTCM_DATA OdomPoseSample s_odom_history[ODOM_HISTORY_SIZE];
-    DTCM_DATA uint16_t s_odom_history_idx = 0;
-    DTCM_DATA VisionLatencyDebug s_vision_latency_debug = {};
-
-    // 常量定义
     constexpr float PLUSE_TO_CM = (2.0f * PI * SystemConfig::WHEEL_RADIUS) / SystemConfig::PULSES_PER_REV;  // 编码器计数转换为轮子移动的距离（cm）
     constexpr float SAMPLE_FREQ = 1.0f / SystemConfig::PIT_CH0_DT_S;  // 采样频率 (Hz)，根据系统定时器周期计算
-    constexpr uint32_t VISION_POSE_MAX_AGE_MS = 300;  // 视觉位姿数据的最大有效时间，超过这个时间就丢弃
-    constexpr float DEFAULT_ENCODER_LATENCY_GAIN = TuningDefaults::DEFAULT_ENCODER_LATENCY_GAIN;
-    constexpr float LONG_DISTANCE_REMAINING_CM = 100.0f;
-    constexpr float VISION_LATERAL_DEADBAND_CM = 0.15f;
-    constexpr float VISION_LATERAL_MAX_STEP_CM = 0.45f;
-    constexpr float VISION_LATERAL_CORRECTION_GAIN = 0.70f;
-    constexpr float VISION_NEAR_AXIS_DEADBAND_CM = 0.15f;
-    constexpr float VISION_NEAR_AXIS_MAX_STEP_CM = 0.45f;
-    constexpr float VISION_NEAR_AXIS_CORRECTION_GAIN = 0.50f;
-    constexpr float VISION_TARGET_FREEZE_RADIUS_CM = 0.5f;
-    constexpr float VISION_REJECT_FLOOR_CM = 3.0f;
 
-    // 快速逆平方根函数，供 Mahony 算法使用
     [[gnu::always_inline]] inline float fast_inv_sqrt(float x) {
         return 1.0f / __builtin_sqrtf(x);
     }
-
-    [[gnu::always_inline]] inline void push_odom_history(uint32_t tick_ms, const Pose2D& pose) {
-        s_odom_history[s_odom_history_idx].tick_ms = tick_ms;
-        s_odom_history[s_odom_history_idx].pose = pose;
-        s_odom_history[s_odom_history_idx].valid = true;
-        s_odom_history_idx = static_cast<uint16_t>((s_odom_history_idx + 1U) % ODOM_HISTORY_SIZE);
-    }
-
-    [[gnu::always_inline]] inline float encoder_latency_gain() {
-        float gain = tune.latency.encoder_latency_gain;
-        if (!std::isfinite(gain)) {
-            gain = DEFAULT_ENCODER_LATENCY_GAIN;
-        }
-        if (gain < TuningDefaults::MIN_ENCODER_LATENCY_GAIN) {
-            return TuningDefaults::MIN_ENCODER_LATENCY_GAIN;
-        }
-        if (gain > TuningDefaults::MAX_ENCODER_LATENCY_GAIN) {
-            return TuningDefaults::MAX_ENCODER_LATENCY_GAIN;
-        }
-        return gain;
-    }
-
-    void reset_odom_history(const Pose2D& pose, uint32_t tick_ms) {
-        s_encoder_pose = pose;
-        s_odom_history_idx = 0;
-        for (auto& sample : s_odom_history) {
-            sample.valid = false;
-        }
-        push_odom_history(tick_ms, s_encoder_pose);
-    }
-
-    [[gnu::always_inline]] inline float pose_distance_sq_xy(const Pose2D& a, const Pose2D& b) {
-        float dx = a.x - b.x;
-        float dy = a.y - b.y;
-        return dx * dx + dy * dy;
-    }
-
-    bool match_vision_pose_to_odom_history(const Pose2D& delayed_vision_pose,
-                                           uint32_t receive_tick_ms,
-                                           Pose2D& out_odom_pose,
-                                           uint32_t& out_capture_tick_ms) {
-        // Estimate the capture time by matching the delayed vision pose to encoder-only history.
-        const OdomPoseSample* best = nullptr;
-        float best_dist_sq = 0.0f;
-
-        for (const auto& sample : s_odom_history) {
-            if (!sample.valid) {
-                continue;
-            }
-
-            uint32_t age_ms = receive_tick_ms - sample.tick_ms;
-            if (age_ms > ODOM_HISTORY_LOOKBACK_MS) {
-                continue;
-            }
-
-            float dist_sq = pose_distance_sq_xy(delayed_vision_pose, sample.pose);
-            if (best == nullptr || dist_sq < best_dist_sq) {
-                best = &sample;
-                best_dist_sq = dist_sq;
-            }
-        }
-
-        if (best == nullptr) {
-            return false;
-        }
-
-        out_odom_pose = best->pose;
-        out_capture_tick_ms = best->tick_ms;
-        return true;
-    }
-
-    bool odom_delta_since_matched_vision_pose(const Pose2D& delayed_vision_pose,
-                                             uint32_t receive_tick_ms,
-                                             uint32_t& out_capture_tick_ms,
-                                             float& out_dx,
-                                             float& out_dy) {
-        out_dx = 0.0f;
-        out_dy = 0.0f;
-
-        Pose2D odom_at_capture;
-        if (!match_vision_pose_to_odom_history(
-                delayed_vision_pose,
-                receive_tick_ms,
-                odom_at_capture,
-                out_capture_tick_ms)) {
-            return false;
-        }
-
-        float gain = encoder_latency_gain();
-        out_dx = (s_encoder_pose.x - odom_at_capture.x) * gain;
-        out_dy = (s_encoder_pose.y - odom_at_capture.y) * gain;
-        return true;
-    }
-
-    bool compensate_vision_latency(const Pose2D& delayed_vision_pose,
-                                   uint32_t receive_tick_ms,
-                                   Pose2D& compensated) {
-        compensated = delayed_vision_pose;
-        float odom_dx = 0.0f;
-        float odom_dy = 0.0f;
-        uint32_t capture_tick_ms = receive_tick_ms;
-        s_vision_latency_debug.valid = false;
-        s_vision_latency_debug.raw_pose = delayed_vision_pose;
-        s_vision_latency_debug.receive_tick_ms = receive_tick_ms;
-        if (!odom_delta_since_matched_vision_pose(
-                delayed_vision_pose,
-                receive_tick_ms,
-                capture_tick_ms,
-                odom_dx,
-                odom_dy)) {
-            return false;
-        }
-
-        compensated.x += odom_dx;
-        compensated.y += odom_dy;
-        s_vision_latency_debug.compensated_pose = compensated;
-        s_vision_latency_debug.odom_dx = odom_dx;
-        s_vision_latency_debug.odom_dy = odom_dy;
-        s_vision_latency_debug.capture_tick_ms = capture_tick_ms;
-        s_vision_latency_debug.valid = true;
-        return true;
-    }
-
-    [[gnu::always_inline]] inline bool calc_smoothed_correction_step(float err,
-                                                                     float deadband,
-                                                                     float max_step,
-                                                                     float gain,
-                                                                     float reject_dist,
-                                                                     float& out_step) {
-        float abs_err = std::abs(err);
-
-        if (abs_err > reject_dist) {
-            return false;
-        }
-        if (abs_err <= deadband) {
-            return false;
-        }
-
-        if (max_step > 0.0f && abs_err > max_step) {
-            err = std::copysign(max_step, err);
-        }
-
-        out_step = err * gain;
-        return true;
-    }
-
-    [[gnu::always_inline]] inline bool apply_smoothed_axis_correction(float vision_axis,
-                                                                      float& odom_axis,
-                                                                      float deadband,
-                                                                      float max_step,
-                                                                      float gain,
-                                                                      float reject_dist) {
-        float step = 0.0f;
-        if (!calc_smoothed_correction_step(vision_axis - odom_axis, deadband, max_step, gain, reject_dist, step)) {
-            return false;
-        }
-
-        odom_axis += step;
-        return true;
-    }
-
-    [[gnu::always_inline]] inline bool apply_smoothed_lateral_correction(float vision_axis, float& odom_axis) {
-        return apply_smoothed_axis_correction(
-            vision_axis,
-            odom_axis,
-            VISION_LATERAL_DEADBAND_CM,
-            VISION_LATERAL_MAX_STEP_CM,
-            VISION_LATERAL_CORRECTION_GAIN,
-            tune.tracker.vision_reject_dist);
-    }
-
-    [[gnu::always_inline]] inline bool apply_smoothed_near_axis_correction(float vision_axis, float& odom_axis) {
-        float reject_dist = tune.tracker.vision_reject_dist;
-        if (reject_dist < VISION_REJECT_FLOOR_CM) {
-            reject_dist = VISION_REJECT_FLOOR_CM;
-        }
-
-        return apply_smoothed_axis_correction(
-            vision_axis,
-            odom_axis,
-            VISION_NEAR_AXIS_DEADBAND_CM,
-            VISION_NEAR_AXIS_MAX_STEP_CM,
-            VISION_NEAR_AXIS_CORRECTION_GAIN,
-            reject_dist);
-    }
-
-    [[gnu::always_inline]] inline bool apply_projected_lateral_correction(const Pose2D& vision_pose,
-                                                                          Pose2D& odom_pose,
-                                                                          float segment_dx,
-                                                                          float segment_dy,
-                                                                          float segment_len_sq) {
-        float inv_len = 1.0f / __builtin_sqrtf(segment_len_sq);
-        float normal_x = -segment_dy * inv_len;
-        float normal_y = segment_dx * inv_len;
-        float err = (vision_pose.x - odom_pose.x) * normal_x +
-                    (vision_pose.y - odom_pose.y) * normal_y;
-
-        float step = 0.0f;
-        if (!calc_smoothed_correction_step(
-                err,
-                VISION_LATERAL_DEADBAND_CM,
-                VISION_LATERAL_MAX_STEP_CM,
-                VISION_LATERAL_CORRECTION_GAIN,
-                tune.tracker.vision_reject_dist,
-                step)) {
-            return false;
-        }
-
-        odom_pose.x += normal_x * step;
-        odom_pose.y += normal_y * step;
-        return true;
-    }
-
 }
 
 
 // =============================================================================
 // 模块 1: 初始化与坐标重置
 // =============================================================================
-
 void init() {
     gyro_z_offset = 0.0f; gyro_x_offset = 0.0f; gyro_y_offset = 0.0f;
     dynamic_deadband = 0.1f;
     is_calibrated = false;
     q0 = 0.70710678f; q1 = 0.0f; q2 = 0.0f; q3 = 0.70710678f;  // 初始化四元数 (Yaw = 90度)
-    reset_odom_history(App::g_state.physical.pose, 0);
     imu_icm42688.init();  // ICM42688 IMU 初始化 (spi)
 }
 
-/// \brief 强制设置当前物理位姿
-/// \param x 全局 X 坐标 cm
-/// \param y 全局 Y 坐标 cm
-/// \param yaw_deg 全局 yaw 角度，单位度
-///
-/// \details
-/// 会同时重置 yaw 四元数和全局位姿，常用于出库前初始定位或视觉标定成功后同步状态
-///
 void set_position(float x, float y, float yaw_deg) {
     // 1. 重置坐标
     App::g_state.physical.pose.x = x;
@@ -337,7 +70,6 @@ void set_position(float x, float y, float yaw_deg) {
     
     // 3. 同步状态树
     App::g_state.physical.pose.yaw = yaw_deg;
-    reset_odom_history(App::g_state.physical.pose, Core::Scheduler::get_sys_tick_ms());
 }
 
 
@@ -349,12 +81,7 @@ const DebugProbes& get_debug_probes() {
     return g_probes;
 }
 
-/// \brief IMU 开机静态标定
-///
-/// \details
-/// 丢弃前 100 帧后累计 600 帧陀螺仪数据求零偏，并根据 Z 轴噪声标准差生成动态死区
-/// 函数是阻塞式启动流程，只应在开机静止时调用
-///
+// IMU 开机静态标定，累计 600 次数据求平均，得到 gyro_z_offset
 void calibrate_gyro_step() {
     if (is_calibrated) return; 
     
@@ -401,12 +128,7 @@ void calibrate_gyro_step() {
     is_calibrated = true; 
 }
 
-/// \brief 自适应 Mahony 六轴姿态融合
-///
-/// \details
-/// 当加速度模长偏离 1G 时衰减加速度修正增益，减少急加减速对姿态的污染
-/// 输入角速度单位为 rad/s，加速度单位为 G
-///
+// 自适应四元数解算
 __attribute__((section(".ramfunc")))
 void adaptive_mahony_update(float gx, float gy, float gz, float ax, float ay, float az) {
     float norm;
@@ -467,12 +189,7 @@ void adaptive_mahony_update(float gx, float gy, float gz, float ax, float ay, fl
     q0 *= norm; q1 *= norm; q2 *= norm; q3 *= norm;
 }
 
-/// \brief 1ms 姿态解算周期
-///
-/// \details
-/// 从最新 IMU 数据扣除零偏和死区，执行 Mahony 融合并更新全局 yaw
-/// 该函数在 PIT_CH0 中断中调用，应保持固定耗时
-///
+// 1ms 姿态解算定时器
 __attribute__((section(".ramfunc")))
 void update_yaw_1ms_tick() {
     if (!is_calibrated) return; 
@@ -559,14 +276,7 @@ void update_yaw_1ms_tick() {
 // 模块 3: 编码器定位
 // =============================================================================
 
-/// \brief 20ms 里程计位置更新
-/// \param encoder_counts 四轮编码器周期增量
-/// \param current_yaw_deg 当前 yaw 角度，单位度
-///
-/// \details
-/// 先把四轮增量解算为车体系位移，再用当前 yaw 投影到全局坐标
-/// kinematic_gain_x/y 用于补偿底盘安装和滑移造成的比例误差
-///
+// 20ms 位置更新定时器：基于当前的 Yaw 角度和编码器增量进行里程计计算
 __attribute__((section(".ramfunc")))
 void update_position_20ms_tick(const int16_t* encoder_counts, float current_yaw_deg) {
 
@@ -595,99 +305,19 @@ void update_position_20ms_tick(const int16_t* encoder_counts, float current_yaw_
     // 更新全局物理位姿
     App::g_state.physical.pose.x += dx_global;
     App::g_state.physical.pose.y += dy_global;
-
-    s_encoder_pose.x += dx_global;
-    s_encoder_pose.y += dy_global;
-    s_encoder_pose.yaw = current_yaw_deg;
-    push_odom_history(Core::Scheduler::get_sys_tick_ms(), s_encoder_pose);
 }
 
 
 // =============================================================================
 // 模块 4: 视觉标定与坐标修正
 // =============================================================================
-
-/// \brief 根据最新视觉位姿修正当前直线段的坐标
-/// \param segment_start 当前直线段起点
-/// \param segment_end 当前直线段终点
-/// \param last_consumed_seq 外层保存的最后一帧已处理视觉序号
-/// \return 成功应用视觉修正时返回 true
-///
-/// \details
-/// 先用编码器纯积分补偿视觉管线延时；离目标 100cm 外只修垂直于运动方向的误差，进入 100cm 内修正 X/Y 两轴
-/// 按视觉帧序号消费新数据，不清 art1_pose_updated，避免与标定/调试流程抢同一个 bool 标志
-///
-bool apply_vision_axis_correction(const Point2D& segment_start, const Point2D& segment_end,
-                                  uint32_t& last_consumed_seq) {
-    float dx = segment_end.x - segment_start.x;
-    float dy = segment_end.y - segment_start.y;
-    float segment_len_sq = dx * dx + dy * dy;
-    if (segment_len_sq < 1.0f) {
-        // 段长过短时无法可靠判断主轴和横向轴
-        return false;
-    }
-
-    auto& vision_data = App::g_state.vision;
-    uint32_t seq = vision_data.art1_pose_seq;
-    if (seq == 0 || seq == last_consumed_seq) {
-        return false;
-    }
-    last_consumed_seq = seq;
-
-    // ART1 位姿可能比底盘周期慢，过期数据不参与闭环修正
-    uint32_t pose_age_ms = Core::Scheduler::get_sys_tick_ms() - vision_data.art1_pose_tick_ms;
-    if (pose_age_ms > VISION_POSE_MAX_AGE_MS) {
-        return false;
-    }
-
-    Pose2D raw_vision_pose = vision_data.art1_pose_buffer[vision_data.art1_pose_publish_idx];
-    if (!std::isfinite(raw_vision_pose.x) || !std::isfinite(raw_vision_pose.y) || !std::isfinite(raw_vision_pose.yaw)) {
-        return false;
-    }
-    Pose2D vision_pose;
-    if (!compensate_vision_latency(raw_vision_pose, vision_data.art1_pose_tick_ms, vision_pose)) {
-        return false;
-    }
-
-    auto& pose = App::g_state.physical.pose;
-    float remain_x = segment_end.x - pose.x;
-    float remain_y = segment_end.y - pose.y;
-    float remain_sq = remain_x * remain_x + remain_y * remain_y;
-    if (remain_sq <= VISION_TARGET_FREEZE_RADIUS_CM * VISION_TARGET_FREEZE_RADIUS_CM) {
-        return false;
-    }
-
-    float before_x = pose.x;
-    float before_y = pose.y;
-    bool long_distance_phase =
-        remain_sq >= LONG_DISTANCE_REMAINING_CM * LONG_DISTANCE_REMAINING_CM;
-
-    bool applied = false;
-    if (!long_distance_phase) {
-        applied = apply_smoothed_near_axis_correction(vision_pose.x, pose.x);
-        applied = apply_smoothed_near_axis_correction(vision_pose.y, pose.y) || applied;
-    } else {
-        applied = apply_projected_lateral_correction(vision_pose, pose, dx, dy, segment_len_sq);
-    }
-
-    s_vision_latency_debug.correction_x = pose.x - before_x;
-    s_vision_latency_debug.correction_y = pose.y - before_y;
-    return applied;
-}
+__attribute__((section(".dtcm_data"))) VisionCalibrator vision_calibrator;
+static AsyncCalibState s_calib_state = AsyncCalibState::IDLE;
 
 void reset_async_calibrate() {
     s_calib_state = AsyncCalibState::IDLE;
 }
 
-/// \brief 异步非阻塞视觉标定函数
-/// \param timeout_ms 标定最长等待时间 ms
-/// \param reject_threshold 视觉结果与当前位姿的最大允许偏差 cm
-/// \return 当前标定状态
-///
-/// \details
-/// 成功时会用收敛后的视觉坐标覆盖当前里程计位置，yaw 保持当前陀螺仪估计
-/// 标定过程按视觉帧序号消费新数据，不依赖 art1_pose_updated 标志
-///
 __attribute__((section(".ramfunc"))) 
 AsyncCalibState async_calibrate_vision(uint32_t timeout_ms, float reject_threshold) {
     auto& pos = App::g_state.physical.pose;
@@ -698,8 +328,7 @@ AsyncCalibState async_calibrate_vision(uint32_t timeout_ms, float reject_thresho
     if (s_calib_state == AsyncCalibState::IDLE) {
         ctrl.mode = ControlMode::POINT_TRACKING; // 锁死底盘
         vision_calibrator.reset();
-        // 记录进入标定前的序号，只消费之后到达的新视觉帧
-        s_last_calib_vision_seq = vision_data.art1_pose_seq;
+        vision_data.art1_pose_updated = false;
         s_calib_state = AsyncCalibState::BUSY;
         return AsyncCalibState::BUSY;
     }
@@ -720,12 +349,9 @@ AsyncCalibState async_calibrate_vision(uint32_t timeout_ms, float reject_thresho
     }
 
     // 喂入新数据
-    uint32_t seq = vision_data.art1_pose_seq;
-    if (seq != s_last_calib_vision_seq) {
-        // 按序号取新帧，而不是靠 bool 标志，避免标志被其它校正流程清掉
-        s_last_calib_vision_seq = seq;
-        Pose2D vision_pose = vision_data.art1_pose_buffer[vision_data.art1_pose_publish_idx];
-        vision_calibrator.push(vision_pose.x, vision_pose.y, vision_pose.yaw);
+    if (vision_data.art1_pose_updated) {
+        vision_data.art1_pose_updated = false;
+        vision_calibrator.push(vision_data.art1_pose.x, vision_data.art1_pose.y, vision_data.art1_pose.yaw);
     }
 
     // 检查收敛
@@ -751,10 +377,6 @@ AsyncCalibState async_calibrate_vision(uint32_t timeout_ms, float reject_thresho
     }
 
     return s_calib_state; // BUSY
-}
-
-const VisionLatencyDebug& get_vision_latency_debug() {
-    return s_vision_latency_debug;
 }
 
 

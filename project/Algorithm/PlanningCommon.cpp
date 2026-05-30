@@ -56,10 +56,10 @@ struct SimpleBfsWorkspace {
     uint16_t current_gen = 0;                        // 当前 BFS 代数
 };
 
-// 时间搜索工作区默认放 OCRAM，避免挤占 DTCM
+// 时间搜索工作区放 OCRAM，避免挤占 DTCM
 static TimeSearchWorkspace time_ws;
 
-// 普通 BFS 工作区默认放 OCRAM，消除热点函数中的局部大数组
+// 普通 BFS 工作区放 OCRAM，消除热点函数中的局部大数组
 static SimpleBfsWorkspace simple_bfs_ws;
 
 // 将 32 位内部代价钳制到对外 uint16_t 代价范围
@@ -1046,6 +1046,185 @@ bool append_box_push_path(SokobanLevel& lvl, point& player_pos, const BoxPushTas
 
     lvl.boxes[moving_box] = task.box_target;
     player_pos = final_car_pos;
+    return true;
+}
+
+bool get_direct_bomb_push_path_cost(
+    const SokobanLevel& lvl,
+    point player_start,
+    const BombTask& task,
+    uint16_t& out_cost,
+    point& out_final_player) {
+    out_cost = 0;
+    out_final_player = {-1, -1};
+    if (task.bomb_start.x == -1 || task.target_wall.x == -1) return false;
+    if (task.box_pushes.size() > 0) return false;
+
+    uint8_t blocked[MAP_MAX_HEIGHT][MAP_MAX_WIDTH] = {};
+    for (int i = 0; i < lvl.box_count; ++i) {
+        point p = lvl.boxes[i];
+        if (p.x >= 0 && p.x < MAP_MAX_WIDTH && p.y >= 0 && p.y < MAP_MAX_HEIGHT) {
+            blocked[p.y][p.x] = 1;
+        }
+    }
+    for (int i = 0; i < lvl.bomb_count; ++i) {
+        point p = lvl.bombs[i];
+        if (p.x == -1) continue;
+        if (p == task.bomb_start) continue;
+        if (p.x >= 0 && p.x < MAP_MAX_WIDTH && p.y >= 0 && p.y < MAP_MAX_HEIGHT) {
+            blocked[p.y][p.x] = 1;
+        }
+    }
+
+    std::memset(b_ws.visited, 0, sizeof(b_ws.visited));
+    const SokobanLevel& cur_lvl = lvl;
+
+    auto is_passable = [&](int x, int y, bool is_bomb_moving) {
+        if (x < 0 || x >= MAP_MAX_WIDTH || y < 0 || y >= MAP_MAX_HEIGHT) return false;
+        if (cur_lvl.map[y][x] == 1) {
+            if (is_bomb_moving && x == task.target_wall.x && y == task.target_wall.y) {}
+            else return false;
+        }
+        if (blocked[y][x]) return false;
+        return true;
+    };
+
+    auto micro_distance = [&](point start, point end, point obstacle_bomb) {
+        if (start == end) return 0;
+        if (!is_passable(end.x, end.y, false)) return 9999;
+
+        b_ws.micro_gen++;
+        if (b_ws.micro_gen == 0) {
+            std::memset(b_ws.micro_visited, 0, sizeof(b_ws.micro_visited));
+            b_ws.micro_gen = 1;
+        }
+
+        int h = 0, t = 0;
+        uint8_t dist[MAP_MAX_HEIGHT][MAP_MAX_WIDTH];
+        b_ws.micro_q[t++] = start;
+        b_ws.micro_visited[start.y][start.x] = b_ws.micro_gen;
+        dist[start.y][start.x] = 0;
+
+        while (h < t) {
+            point curr = b_ws.micro_q[h++];
+            if (curr == end) return static_cast<int>(dist[curr.y][curr.x]);
+            for (int d = 0; d < 4; ++d) {
+                point np = curr + MOVE[d];
+                if (np.x < 0 || np.x >= MAP_MAX_WIDTH || np.y < 0 || np.y >= MAP_MAX_HEIGHT) continue;
+                if (b_ws.micro_visited[np.y][np.x] == b_ws.micro_gen) continue;
+                if (is_passable(np.x, np.y, false) && !(np == obstacle_bomb)) {
+                    b_ws.micro_visited[np.y][np.x] = b_ws.micro_gen;
+                    dist[np.y][np.x] = static_cast<uint8_t>(dist[curr.y][curr.x] + 1);
+                    b_ws.micro_q[t++] = np;
+                }
+            }
+        }
+        return 9999;
+    };
+
+    int head = 0, tail = 0;
+    int target_node_idx = -1;
+
+    for (int d = 0; d < 4; ++d) {
+        point push_pos = {
+            static_cast<int8_t>(task.bomb_start.x - MOVE[d].x),
+            static_cast<int8_t>(task.bomb_start.y - MOVE[d].y)
+        };
+        if (is_passable(push_pos.x, push_pos.y, false) &&
+            micro_distance(player_start, push_pos, task.bomb_start) != 9999) {
+            b_ws.visited[task.bomb_start.y][task.bomb_start.x] |= (1 << d);
+            b_ws.q[tail++] = {task.bomb_start.x, task.bomb_start.y, (uint8_t)d, 65535};
+        }
+    }
+
+    while (head < tail) {
+        int curr_idx = head++;
+        BombMacroNode curr = b_ws.q[curr_idx];
+
+        if (curr.bx == task.target_wall.x && curr.by == task.target_wall.y) {
+            target_node_idx = curr_idx;
+            break;
+        }
+
+        point curr_p = {
+            static_cast<int8_t>(curr.bx - MOVE[curr.p_dir].x),
+            static_cast<int8_t>(curr.by - MOVE[curr.p_dir].y)
+        };
+
+        int nbx = curr.bx + MOVE[curr.p_dir].x;
+        int nby = curr.by + MOVE[curr.p_dir].y;
+        if (is_passable(nbx, nby, true)) {
+            if (!(b_ws.visited[nby][nbx] & (1 << curr.p_dir))) {
+                b_ws.visited[nby][nbx] |= (1 << curr.p_dir);
+                b_ws.q[tail++] = {(int8_t)nbx, (int8_t)nby, curr.p_dir, (uint16_t)curr_idx};
+            }
+        }
+
+        for (int d = 0; d < 4; ++d) {
+            if (d == curr.p_dir) continue;
+            point adj_p = {
+                static_cast<int8_t>(curr.bx - MOVE[d].x),
+                static_cast<int8_t>(curr.by - MOVE[d].y)
+            };
+
+            if (is_passable(adj_p.x, adj_p.y, false)) {
+                if (!(b_ws.visited[curr.by][curr.bx] & (1 << d))) {
+                    if (micro_distance(curr_p, adj_p, {curr.bx, curr.by}) != 9999) {
+                        b_ws.visited[curr.by][curr.bx] |= (1 << d);
+                        b_ws.q[tail++] = {curr.bx, curr.by, (uint8_t)d, (uint16_t)curr_idx};
+                    }
+                }
+            }
+        }
+    }
+
+    if (target_node_idx == -1) return false;
+
+    StaticArray<BombMacroNode, 256> macro_path;
+    int curr_idx = target_node_idx;
+    while (curr_idx != 65535) {
+        macro_path.push_back(b_ws.q[curr_idx]);
+        curr_idx = b_ws.q[curr_idx].parent_idx;
+    }
+    std::reverse(macro_path.begin(), macro_path.end());
+    if (macro_path.empty()) return false;
+
+    int cost = 0;
+    point current_car_pos = player_start;
+    point first_push_pos = {
+        static_cast<int8_t>(macro_path[0].bx - MOVE[macro_path[0].p_dir].x),
+        static_cast<int8_t>(macro_path[0].by - MOVE[macro_path[0].p_dir].y)
+    };
+    int first_walk = micro_distance(current_car_pos, first_push_pos, task.bomb_start);
+    if (first_walk == 9999) return false;
+    cost += first_walk;
+    current_car_pos = first_push_pos;
+
+    for (int i = 0; i < macro_path.size() - 1; ++i) {
+        BombMacroNode c_node = macro_path[i];
+        BombMacroNode n_node = macro_path[i + 1];
+
+        if (c_node.bx != n_node.bx || c_node.by != n_node.by) {
+            cost += 1;
+            current_car_pos = {c_node.bx, c_node.by};
+        } else {
+            point target_face = {
+                static_cast<int8_t>(n_node.bx - MOVE[n_node.p_dir].x),
+                static_cast<int8_t>(n_node.by - MOVE[n_node.p_dir].y)
+            };
+            int walk = micro_distance(current_car_pos, target_face, {c_node.bx, c_node.by});
+            if (walk == 9999) return false;
+            cost += walk;
+            current_car_pos = target_face;
+        }
+    }
+
+    out_final_player = {
+        static_cast<int8_t>(macro_path.back().bx - MOVE[macro_path.back().p_dir].x),
+        static_cast<int8_t>(macro_path.back().by - MOVE[macro_path.back().p_dir].y)
+    };
+    cost += 1;
+    out_cost = static_cast<uint16_t>(cost > UINT16_MAX ? UINT16_MAX : cost);
     return true;
 }
 

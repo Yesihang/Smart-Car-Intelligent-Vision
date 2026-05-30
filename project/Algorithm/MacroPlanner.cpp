@@ -511,6 +511,42 @@ MacroPlanner::SemanticInferenceStatus MacroPlanner::infer_semantics(const Sokoba
     return SemanticInferenceStatus::INVALID;
 }
 
+/// \brief 为旧版 Phase2 求解器导出一个确定的 box -> target_id 兼容映射
+/// \param level 当前逻辑地图
+/// \param labels Macro 已推断出的完整语义标签
+/// \param out_matched_ids 输出映射，out_matched_ids[box_id] 为目标点编号
+/// \return 所有箱子均能在同语义目标集合中分配到目标时返回 true
+///
+/// \details
+/// 这是兼容层，不是 Macro 的语义模型。重复语义下会按同语义目标的自然顺序
+/// 给旧求解器生成一个一一匹配；后续 Sokoban 融合成语义组后，这层可以移除。
+bool MacroPlanner::build_semantic_matched_ids(const SokobanLevel& level,
+                                              const int8_t* labels,
+                                              uint8_t* out_matched_ids) const {
+    if (!labels || !out_matched_ids) return false;
+    if (level.box_count != level.target_count) return false;
+
+    bool used_targets[MAX_BOXES] = {false};
+    for (int b = 0; b < level.box_count; ++b) {
+        int8_t box_sem = labels[b];
+        if (!is_valid_semantic_id(box_sem)) return false;
+
+        int chosen = -1;
+        for (int t = 0; t < level.target_count; ++t) {
+            int8_t target_sem = labels[level.box_count + t];
+            if (used_targets[t] || target_sem != box_sem) continue;
+            chosen = t;
+            break;
+        }
+        if (chosen < 0) return false;
+
+        used_targets[chosen] = true;
+        out_matched_ids[b] = static_cast<uint8_t>(chosen);
+    }
+
+    return true;
+}
+
 // 将推断出的完整语义写回 Macro 状态，并同步到 semantic_labels。
 // 这样后续 sync_semantics 再次运行时，不会把补充观测失败后的回退结果冲掉。
 bool MacroPlanner::apply_inferred_semantics(const SokobanLevel& level, const int8_t* inferred_labels) {
@@ -533,22 +569,13 @@ bool MacroPlanner::apply_inferred_semantics(const SokobanLevel& level, const int
     knowledge_state.semantics_ready = true;
     knowledge_state.needs_supplemental_observe = false;
 
-    // 完成式推箱若重新打开，需要一份临时自然顺序目标；最终 Sokoban 只看语义组
-    bool used_targets[MAX_BOXES] = {false};
-    for (int b = 0; b < box_count; ++b) {
-        int chosen = -1;
-        int8_t box_sem = knowledge_state.inferred_semantics[b];
-        for (int t = 0; t < target_count; ++t) {
-            int8_t target_sem = knowledge_state.inferred_semantics[box_count + t];
-            if (used_targets[t] || target_sem != box_sem) continue;
-            chosen = t;
-            break;
-        }
-        if (chosen < 0) return false;
+    uint8_t matched[MAX_BOXES];
+    if (!build_semantic_matched_ids(level, knowledge_state.inferred_semantics, matched)) return false;
 
-        used_targets[chosen] = true;
-        knowledge_state.candidate_targets[b] = (1U << chosen);
-        knowledge_state.bound_target[b] = static_cast<uint8_t>(chosen);
+    for (int b = 0; b < box_count; ++b) {
+        if (matched[b] >= target_count) continue;
+        knowledge_state.candidate_targets[b] = (1U << matched[b]);
+        knowledge_state.bound_target[b] = matched[b];
         knowledge_state.is_bound[b] = true;
     }
 
@@ -584,7 +611,7 @@ void MacroPlanner::apply_observation(const SokobanLevel& level, uint32_t mask) {
 ///
 /// \details
 /// 函数先同步 vision 语义池，再按“同语义数量相等”的规则做实体语义推断。
-/// 语义完整后只额外生成完成式推箱候选位需要的临时自然顺序映射。
+/// 只有语义完整后，才额外生成旧版 Sokoban 所需的兼容匹配，避免重复语义时留下脏绑定。
 void MacroPlanner::sync_semantics(const int8_t* labels) {
     if (!labels) return;
     for (int i = 0; i < MAX_ENTITIES; ++i) {
@@ -628,22 +655,49 @@ bool MacroPlanner::ready_for_sokoban(const SokobanLevel& level) const {
     return true;
 }
 
-/// \brief 将 Macro 推断出的完整实体语义写回关卡
+/// \brief 输出第二阶段需要的 box -> target 配对
+/// \param out_ids 输出数组，out_ids[box_id] = target_id
+/// \param count 当前箱子数量
+/// \return 配对完整时返回 true
+bool MacroPlanner::fill_matched_ids(uint8_t* out_ids, uint8_t count) {
+    if (!semantics_ready()) return false;
+    for (int b = 0; b < count; ++b) {
+        if (!knowledge_state.is_bound[b]) return false;
+        if (knowledge_state.bound_target[b] >= target_count) return false;
+        out_ids[b] = knowledge_state.bound_target[b];
+    }
+    return true;
+}
+
+/// \brief 输出 Macro 推断出的完整实体语义
+/// \param out_labels 输出数组，前 box_count 项为箱子，后 target_count 项为目标点
+/// \return 语义推断完整时返回 true
+bool MacroPlanner::fill_semantic_labels(int8_t* out_labels) const {
+    if (!out_labels || !semantics_ready()) return false;
+    for (int i = 0; i < box_count + target_count; ++i) {
+        if (!is_valid_semantic_id(knowledge_state.inferred_semantics[i])) return false;
+        out_labels[i] = knowledge_state.inferred_semantics[i];
+    }
+    return true;
+}
+
+/// \brief 将 Macro 推断出的实体语义写回关卡
 /// \param level 当前逻辑地图
 /// \return 语义推断完整时返回 true
 bool MacroPlanner::apply_semantics_to_level(SokobanLevel& level) const {
-    if (!semantics_ready()) return false;
+    int8_t labels[MAX_ENTITIES];
+    if (!fill_semantic_labels(labels)) return false;
+    if (level.box_count > MAX_BOXES || level.target_count > MAX_BOXES) return false;
     if (level.box_count != box_count || level.target_count != target_count) return false;
 
-    for (int b = 0; b < box_count; ++b) {
-        int8_t sem = knowledge_state.inferred_semantics[b];
-        if (!is_valid_semantic_id(sem)) return false;
-        level.box_semantics[b] = static_cast<uint8_t>(sem);
+    for (int b = 0; b < level.box_count; ++b) {
+        if (!is_valid_semantic_id(labels[b])) return false;
+        level.box_semantics[b] = static_cast<uint8_t>(labels[b]);
     }
-    for (int t = 0; t < target_count; ++t) {
-        int8_t sem = knowledge_state.inferred_semantics[box_count + t];
-        if (!is_valid_semantic_id(sem)) return false;
-        level.target_semantics[t] = static_cast<uint8_t>(sem);
+    for (int t = 0; t < level.target_count; ++t) {
+        int idx = level.box_count + t;
+        if (!is_valid_semantic_id(labels[idx])) return false;
+        level.target_semantics[t] = static_cast<uint8_t>(labels[idx]);
     }
     return true;
 }

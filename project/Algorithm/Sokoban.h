@@ -114,6 +114,18 @@ private:
         GameState next_state;       // 完成爆破后的搜索状态
     };
 
+    static constexpr int MACRO_COST_CACHE_SIZE = 512;
+    struct MacroCostCacheEntry {
+        uint32_t hash;
+        uint16_t cost;
+        int8_t final_x;
+        int8_t final_y;
+        uint8_t bomb_idx;
+        uint8_t final_dir;
+        uint8_t flags;              // bit0=valid, bit1=success
+        uint8_t reserved;
+    };
+
     // 单节点动态占用表：以 192B 栈空间换掉热路径内反复线性扫描箱子/炸弹数组
     // cell 中 0..15 表示箱子下标，BOMB_BASE 之后表示炸弹下标，-1 表示空格
     struct NodeOccupancy {
@@ -156,7 +168,10 @@ private:
         int threshold,
         StaticArray<point, MAX_PATH_LENGTH>& path,
         int last_entity = -1,
-        uint8_t last_push_dir = 4);
+        uint8_t last_push_dir = 4,
+        int known_h = -1,
+        int known_active_bombs = -1,
+        bool tt_already_clear = false);
     // 统计尚未完成且有目标墙的炸弹任务数
     int count_active_bomb_tasks(const GameState& state) const;
     // 仅在仍有炸弹任务时估计箱子推动压力，用于动作排序
@@ -182,6 +197,7 @@ private:
     // 生成可选炸弹宏动作；只在宏动作开关启用时产生候选
     int generate_bomb_macros(
         const GameState& state,
+        const NodeOccupancy& occupancy,
         int h_before,
         int active_entities,
         int g,
@@ -233,6 +249,7 @@ private:
     // 预计算每个炸弹到目标墙的反向推动距离
     void precompute_bomb_distances();
     void precompute_bomb_macro_costs();
+    void precompute_solid_masks();
     // 预计算静态地图上的任意两格行走距离下界
     void precompute_walk_distances();
     // 标记静态死锁格，供动作生成时快速剪枝
@@ -265,6 +282,8 @@ private:
     StaticArray<BombTask, MAX_BOMBS> bomb_tasks;                         // 按初始炸弹编号索引的清墙任务
     uint8_t num_bomb_tasks = 0;                                          // 有效炸弹任务/炸弹槽数量
     uint8_t b_macro_cost[MAX_BOMBS][MAP_MAX_HEIGHT][MAP_MAX_WIDTH][4];   // 炸弹宏动作乐观路径下界，255 表示不可达
+    MacroCostCacheEntry macro_cost_cache[MACRO_COST_CACHE_SIZE] = {};
+    uint8_t solid_mask[1 << MAX_BOMBS][MAP_MAX_HEIGHT][MAP_MAX_WIDTH] = {};
 
     // --- Zobrist 随机表与路径环路检测 ---
     uint32_t ZOBRIST_SPECIFIC_BOX[MAX_BOXES][MAP_MAX_HEIGHT][MAP_MAX_WIDTH];   // 带语义编号的箱子哈希
@@ -278,6 +297,8 @@ private:
     int16_t t_dist[MAX_BOXES][MAP_MAX_HEIGHT][MAP_MAX_WIDTH];           // target_id -> cell 的反向推箱距离，-1 表示不可达
     uint8_t relaxed_walk_dist[MAP_CELL_COUNT][MAP_CELL_COUNT];          // 静态地图上的压缩行走距离，255 表示不可达
     bool is_dead[MAP_MAX_HEIGHT][MAP_MAX_WIDTH];                        // 静态死锁格缓存
+    uint16_t target_semantic_mask[10] = {};
+    uint16_t target_cell_mask[10][MAP_MAX_HEIGHT][MAP_MAX_WIDTH] = {};
 
     int16_t b_dist[MAX_BOMBS][MAP_MAX_HEIGHT][MAP_MAX_WIDTH];           // bomb_id -> cell 的反向推炸弹距离，-1 表示不可达
     uint8_t wall_clear_mask[MAP_MAX_HEIGHT][MAP_MAX_WIDTH];             // 每个墙格会被哪些炸弹任务清除的 bitmask

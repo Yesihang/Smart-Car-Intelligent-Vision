@@ -6,8 +6,6 @@
 
 namespace App {
 
-inline constexpr uint8_t ART1_POSE_STABLE_REQUIRED_FRAMES = 10U;
-
 // 全局机器人状态结构体，包含游戏状态、视觉输入、规划结果、控制指令和物理状态等信息，供各模块读写共享 
 struct RobotState {
 
@@ -35,21 +33,15 @@ struct RobotState {
 
         // ART1 定位推算
         Pose2D art1_pose = {0.0f, 0.0f, 0.0f};
-        Pose2D art1_pose_buffer[2] = {};        // ART1 位姿双缓冲，避免中断写入时读到半帧数据
-        uint8_t art1_pose_publish_idx = 0;      // 当前发布给业务层读取的缓冲下标
-        uint32_t art1_pose_seq = 0;             // 位姿帧序号，用于判断是否有新数据
-        uint32_t art1_pose_tick_ms = 0;         // 位姿帧接收时间，用于拒绝过期视觉数据
         
         // ART1 业务同步标志位
-        uint8_t art1_pose_stable_count = 0;     // Stable ART1 pose frame count for motion control gating
         bool art1_map_ready = false;
         bool art1_pose_updated = false;
-        bool art1_pose_request_pending = false;
         // ART2 业务同步标志位
         bool art2_result_ready = false;
         // ART2 异步流水线状态
         bool capture_ack_received = false;
-        // 语义缓存池（-1 表示未知，0~9 表示识别到的特征数字；索引顺序为先箱子、再目标点）
+        // 语义缓存池 (-1 表示未识别/正在后台推理，1~10 表示识别到的特征数字，先箱子再目标点，顺序与 patrol_actions 中的 entity_id 一一对应)
         int8_t semantic_labels[SystemConfig::MAX_ENTITIES];
     } vision;
 
@@ -58,13 +50,9 @@ struct RobotState {
         StaticArray<point, SystemConfig::MAX_PATH_LENGTH> grid_path;          // 供 UI 渲染
 
         StaticArray<Point2D, SystemConfig::MAX_PATH_LENGTH> physical_path;    // 物理路径（cm级坐标），供 Tracker 追踪
-        StaticArray<uint8_t, SystemConfig::MAX_PATH_LENGTH> force_stop_at_wp; // 该航点是否必须停稳后再切下一段
         uint16_t current_wp_idx = 0;                                          // 当前正在追的航点索引
 
         StaticArray<BombTask, SystemConfig::MAX_BOMBS> bomb_tasks;            // 炸弹任务列表
-        Point2D vision_segment_start = {0.0f, 0.0f};                          // 当前直线路径段起点，用于判断视觉校正轴向
-        uint32_t vision_last_correction_seq = 0;                              // 已参与运动中校正的最后一帧视觉序号
-        uint32_t vision_last_request_tick_ms = 0;                              // 上次循迹位姿请求时刻
     } planning;
 
     // 4. 控制层 (Tracker 写入，底盘 Chassis 读取)
@@ -88,6 +76,6 @@ struct RobotState {
     } debug;
 };
 
-inline DTCM_DATA RobotState g_state;
+inline __attribute__((section(".dtcm_data"))) RobotState g_state;
 
 }

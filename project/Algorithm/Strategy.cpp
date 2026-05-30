@@ -32,7 +32,7 @@ namespace StrategyConfig {
     // DFS 搜索宽度
     // ------------------------------------------------------------------------
     inline constexpr uint8_t PHASE1_SELECTION_RESTRICTIONS = 3;   // Phase1 每层最多保留的高分候选数
-    inline constexpr uint8_t PHASE2_SELECTION_RESTRICTIONS = 6;   // Phase2 每层最多保留的高分候选数
+    inline constexpr uint8_t PHASE2_SELECTION_RESTRICTIONS = 3;   // Phase2 每层最多保留的高分候选数
 
     // ------------------------------------------------------------------------
     // 距离与收益阈值

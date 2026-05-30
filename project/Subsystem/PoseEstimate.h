@@ -26,7 +26,6 @@ namespace Subsystem::PoseEstimator {
     // 获取探针数据的接口
     const DebugProbes& get_debug_probes();
 
-    // 视觉异步标定状态，供 GameManage 非阻塞推进
     enum class AsyncCalibState {
         IDLE,       // 空闲/刚复位
         BUSY,       // 正在采集中
@@ -34,7 +33,6 @@ namespace Subsystem::PoseEstimator {
         ERROR       // 超时或偏差过大
     };
 
-    // 视觉标定器类：收集窗口数据并判断视觉结果是否稳定
     class VisionCalibrator {
     public:
         // 配置参数
@@ -126,7 +124,6 @@ namespace Subsystem::PoseEstimator {
 
     // 重置异步函数的内部状态（在每次需要开始一次新标定时调用）
     void reset_async_calibrate();
-
     // 异步非阻塞视觉标定函数
     AsyncCalibState async_calibrate_vision(uint32_t timeout_ms = 2000, float reject_threshold = 4.0f);
 
@@ -136,24 +133,6 @@ namespace Subsystem::PoseEstimator {
 
     // 强行重置里程计坐标
     void set_position(float x, float y, float yaw_deg);
-
-    // Apply latency-compensated vision correction for the current straight segment.
-    bool apply_vision_axis_correction(const Point2D& segment_start, const Point2D& segment_end,
-                                      uint32_t& last_consumed_seq);
-
-    struct VisionLatencyDebug {
-        Pose2D raw_pose;
-        Pose2D compensated_pose;
-        float odom_dx;
-        float odom_dy;
-        float correction_x;
-        float correction_y;
-        uint32_t receive_tick_ms;
-        uint32_t capture_tick_ms;
-        bool valid;
-    };
-
-    const VisionLatencyDebug& get_vision_latency_debug();
 
     // 两个高频中断钩子
     void update_yaw_1ms_tick();

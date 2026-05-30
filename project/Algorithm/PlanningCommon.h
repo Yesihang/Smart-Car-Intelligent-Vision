@@ -153,6 +153,7 @@ bool is_box_position_safe(const SokobanLevel& lvl, uint8_t box_id, uint16_t cand
 
 // --- 推物体路径生成 ---
 bool append_box_push_path(SokobanLevel& lvl, point& player_pos, const BoxPushTask& task, StaticArray<point, MAX_PATH_LENGTH>& out_path);
+bool get_direct_bomb_push_path_cost(const SokobanLevel& lvl, point player_start, const BombTask& task, uint16_t& out_cost, point& out_final_player);
 bool get_bomb_push_path(const SokobanLevel& lvl, point player_start, const BombTask& task, StaticArray<point, MAX_PATH_LENGTH>& out_path);
 
 }
